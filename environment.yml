@@ -1,0 +1,21 @@
+name: smartto
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - tqdm
+  - scikit-learn
+  - jupyter
+  - ipykernel
+  - pip:
+    - torch
+    - torchvision
+    - torchaudio
+    - mediapipe
+    - opencv-python
