@@ -63,7 +63,7 @@ def put_kr_text(frame, text, pos, font_size=22, color=(255,255,255), bg=None):
 # 경로 설정
 # ──────────────────────────────────────────────
 BASE_DIR       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH     = os.path.join(BASE_DIR, "models", "best_model.pt")
+MODEL_PATH     = os.path.join(BASE_DIR, "models", "best_model_finetuned.pt")
 SCALER_PATH    = os.path.join(BASE_DIR, "data", "features", "scaler.pkl")
 THRESHOLD_PATH = os.path.join(BASE_DIR, "models", "threshold.json")
 
@@ -71,7 +71,7 @@ THRESHOLD_PATH = os.path.join(BASE_DIR, "models", "threshold.json")
 # 모델 설정 (step3_train.py와 일치)
 # ──────────────────────────────────────────────
 SEQ_LEN     = 90
-N_FEATURES  = 14    # 원시 8 + 시간적 6
+N_FEATURES  = 14    # 원시 8 (ear_avg,ear_l,ear_r,mar,pitch,yaw,roll,face_det) + 시간적 6
 HIDDEN_SIZE = 64
 NUM_LAYERS  = 1
 DROPOUT     = 0.4
@@ -133,14 +133,20 @@ def compute_head_pose(landmarks, img_w, img_h):
         return 0.0, 0.0, 0.0
     rot_mat, _ = cv2.Rodrigues(rot_vec)
     angles, *_ = cv2.RQDecomp3x3(rot_mat)
-    return angles[0]*360, angles[1]*360, angles[2]*360
+    pitch = float(np.clip(angles[0] * 360, -90.0, 90.0))
+    yaw   = float(np.clip(angles[1] * 360, -90.0, 90.0))
+    roll  = float(np.clip(angles[2] * 360, -90.0, 90.0))
+    return pitch, yaw, roll
 
 
-def compute_temporal_features_realtime(raw_buffer: deque, window: int = TEMPORAL_WINDOW) -> np.ndarray:
+def compute_temporal_features_realtime(raw_buffer: deque, mar_buffer: deque,
+                                        window: int = TEMPORAL_WINDOW) -> np.ndarray:
     """
     실시간 버퍼에서 현재 프레임의 시간적 통계 특징을 계산합니다.
 
-    입력: raw_buffer — deque of (8,) arrays
+    입력:
+        raw_buffer — deque of (7,) arrays [ear_avg, ear_l, ear_r, pitch, yaw, roll, face_detected]
+        mar_buffer — deque of float (MAR 값, mar_std 계산용)
     출력: (6,) array — [ear_std, mar_std, pitch_std, yaw_std, blink_rate, head_move_mag]
     """
     buf = list(raw_buffer)
@@ -149,9 +155,9 @@ def compute_temporal_features_realtime(raw_buffer: deque, window: int = TEMPORAL
     window_data = np.array(buf[start:], dtype=np.float32)
 
     ear_avg = window_data[:, 0]
-    mar     = window_data[:, 3]
-    pitch   = window_data[:, 4]
-    yaw     = window_data[:, 5]
+    mar     = np.array(list(mar_buffer)[start:], dtype=np.float32)
+    pitch   = window_data[:, 4]   # idx: ear_avg=0,ear_l=1,ear_r=2,mar=3,pitch=4
+    yaw     = window_data[:, 5]   # idx: yaw=5
 
     temporal = np.zeros(6, dtype=np.float32)
     temporal[0] = np.std(ear_avg)
@@ -419,7 +425,8 @@ def main():
 
     # 버퍼
     raw_buffer    = deque(maxlen=SEQ_LEN + TEMPORAL_WINDOW)  # 원시 특징 (시간적 계산용 여유)
-    full_buffer   = deque(maxlen=SEQ_LEN)    # 14-dim 전체 특징 시퀀스
+    mar_buffer    = deque(maxlen=SEQ_LEN + TEMPORAL_WINDOW)  # MAR 값 (mar_std 계산용)
+    full_buffer   = deque(maxlen=SEQ_LEN)    # 13-dim 전체 특징 시퀀스
     pred_buffer   = deque(maxlen=DECISION_WINDOW)
     advisor       = AdaptiveSessionAdvisor()
 
@@ -450,12 +457,14 @@ def main():
             mar   = compute_mar(lm)
             pitch, yaw, roll = compute_head_pose(lm, w, h)
 
+            # [ear_avg, ear_l, ear_r, pitch, yaw, roll, face_detected] — MAR raw 제외
             raw_feat = np.array([(ear_l+ear_r)/2, ear_l, ear_r, mar, pitch, yaw, roll, 1.0],
                                 dtype=np.float32)
             raw_buffer.append(raw_feat)
+            mar_buffer.append(mar)
 
             # 시간적 특징 계산
-            temporal_feat = compute_temporal_features_realtime(raw_buffer)
+            temporal_feat = compute_temporal_features_realtime(raw_buffer, mar_buffer)
             full_feat = np.concatenate([raw_feat, temporal_feat])  # (14,)
             full_buffer.append(full_feat)
 
@@ -465,6 +474,7 @@ def main():
                 cv2.circle(frame, (cx, cy), 2, (0, 255, 180), -1)
         else:
             raw_buffer.append(np.zeros(8, dtype=np.float32))
+            mar_buffer.append(0.0)
             full_buffer.append(np.zeros(N_FEATURES, dtype=np.float32))
 
         # SEQ_LEN 프레임 쌓이면 추론

@@ -124,6 +124,11 @@ def compute_head_pose(landmarks, img_w, img_h):
     pitch = angles[0] * 360
     yaw   = angles[1] * 360
     roll  = angles[2] * 360
+
+    # solvePnP 수치 폭발 방지: 물리적으로 불가능한 값 클리핑
+    pitch = float(np.clip(pitch, -90.0, 90.0))
+    yaw   = float(np.clip(yaw,   -90.0, 90.0))
+    roll  = float(np.clip(roll,  -90.0, 90.0))
     return pitch, yaw, roll
 
 
@@ -131,12 +136,16 @@ def compute_head_pose(landmarks, img_w, img_h):
 # 시간적 통계 특징 계산
 # ──────────────────────────────────────────────
 
-def compute_temporal_features(raw_features: np.ndarray, window: int = TEMPORAL_WINDOW) -> np.ndarray:
+def compute_temporal_features(raw_features: np.ndarray, mar_arr: np.ndarray,
+                               window: int = TEMPORAL_WINDOW) -> np.ndarray:
     """
-    프레임별 원시 특징 시퀀스로부터 시간적 통계 특징을 계산합니다.
+    프레임별 원시 특징 + MAR 배열로 시간적 통계 특징을 계산합니다.
 
-    입력: raw_features (T, 8) — [ear_avg, ear_l, ear_r, mar, pitch, yaw, roll, face_detected]
-    출력: temporal (T, 6)    — [ear_std, mar_std, pitch_std, yaw_std, blink_rate, head_move_mag]
+    입력:
+        raw_features (T, 7) — [ear_avg, ear_l, ear_r, pitch, yaw, roll, face_detected]
+        mar_arr      (T,)   — MAR 값 (raw에서 제거됐지만 mar_std 계산에 사용)
+    출력:
+        temporal (T, 6)    — [ear_std, mar_std, pitch_std, yaw_std, blink_rate, head_move_mag]
 
     각 프레임 t에서 [max(0, t-window+1) : t+1] 윈도우의 통계를 계산합니다.
     """
@@ -144,9 +153,9 @@ def compute_temporal_features(raw_features: np.ndarray, window: int = TEMPORAL_W
     temporal = np.zeros((T, 6), dtype=np.float32)
 
     ear_avg = raw_features[:, 0]
-    mar     = raw_features[:, 3]
-    pitch   = raw_features[:, 4]
-    yaw     = raw_features[:, 5]
+    mar     = mar_arr          # 별도 전달된 MAR 배열
+    pitch   = raw_features[:, 3]
+    yaw     = raw_features[:, 4]
 
     for t in range(T):
         start = max(0, t - window + 1)
@@ -180,16 +189,17 @@ def compute_temporal_features(raw_features: np.ndarray, window: int = TEMPORAL_W
 # 최종 특징 이름 (원시 8 + 시간적 6 = 14)
 # ──────────────────────────────────────────────
 RAW_FEATURE_NAMES = [
-    "ear_avg", "ear_left", "ear_right", "mar",
+    "ear_avg", "ear_left", "ear_right",
     "pitch", "yaw", "roll", "face_detected",
+    # MAR 제거: r=-0.022로 레이블과 상관관계 없음 (mar_std는 temporal에서 유지)
 ]
 TEMPORAL_FEATURE_NAMES = [
     "ear_std", "mar_std", "pitch_std", "yaw_std",
     "blink_rate", "head_move_mag",
 ]
 FEATURE_NAMES = RAW_FEATURE_NAMES + TEMPORAL_FEATURE_NAMES
-N_RAW_FEATURES = len(RAW_FEATURE_NAMES)
-N_FEATURES = len(FEATURE_NAMES)
+N_RAW_FEATURES = len(RAW_FEATURE_NAMES)   # 7
+N_FEATURES = len(FEATURE_NAMES)            # 13
 MAX_FRAMES = 300
 
 
@@ -212,6 +222,7 @@ def extract_features_from_video(video_path: str, face_mesh) -> np.ndarray:
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     raw_features = []
+    mar_values   = []   # mar_std 계산용으로만 별도 보관
 
     while cap.isOpened() and len(raw_features) < MAX_FRAMES:
         ret, frame = cap.read()
@@ -228,19 +239,23 @@ def extract_features_from_video(video_path: str, face_mesh) -> np.ndarray:
             ear_avg = (ear_l + ear_r) / 2.0
             mar = compute_mar(lm)
             pitch, yaw, roll = compute_head_pose(lm, w, h)
-            raw_features.append([ear_avg, ear_l, ear_r, mar, pitch, yaw, roll, 1.0])
+            # [ear_avg, ear_l, ear_r, pitch, yaw, roll, face_detected] — MAR raw 제외
+            raw_features.append([ear_avg, ear_l, ear_r, pitch, yaw, roll, 1.0])
+            mar_values.append(mar)
         else:
-            raw_features.append([0.0] * (N_RAW_FEATURES - 1) + [0.0])
+            raw_features.append([0.0] * N_RAW_FEATURES)
+            mar_values.append(0.0)
 
     cap.release()
 
     if len(raw_features) == 0:
         return np.zeros((1, N_FEATURES), dtype=np.float32)
 
-    raw_arr = np.array(raw_features, dtype=np.float32)  # (T, 8)
-    temporal_arr = compute_temporal_features(raw_arr)     # (T, 6)
+    raw_arr = np.array(raw_features, dtype=np.float32)   # (T, 7)
+    mar_arr = np.array(mar_values,   dtype=np.float32)   # (T,)
+    temporal_arr = compute_temporal_features(raw_arr, mar_arr)  # (T, 6)
 
-    return np.concatenate([raw_arr, temporal_arr], axis=1)  # (T, 14)
+    return np.concatenate([raw_arr, temporal_arr], axis=1)  # (T, 13)
 
 
 # ──────────────────────────────────────────────
