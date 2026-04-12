@@ -1,546 +1,492 @@
 """
-Step 4: 실시간 카메라 집중도 추론 + 적응형 뽀모도로 세션 관리
-------------------------------------------------------
-학습된 GRU 모델로 웹캠 영상을 분석해
-실시간으로 집중도를 판단하고 다음 세션/휴식을 동적으로 추천합니다.
+Step 4: 실시간 집중도 추론 + 적응형 뽀모도로 타이머
 
-적응형 세션 로직:
-    - 집중도가 높으면 → 다음 세션 +5분 연장, 휴식도 조금 더 부여
-    - 집중도가 낮으면 → 다음 세션 단축, 짧은 휴식 후 재시작 유도
+구조:
+  1층 - Rule-based (확정적 판단):
+    - 연속 2초 이상 눈 감김 → 확정 비집중
+    - 하품 감지 → 확정 비집중
+    - 얼굴 미감지 3초 이상 → 확정 비집중
 
-실행 방법:
-    python src/step4_realtime.py
+  2층 - XGBoost (미세 판단):
+    - Rule이 트리거되지 않을 때 ML 모델로 집중도 예측
+    - 최근 N초간의 feature 통계량으로 판단
 
-조작법:
-    Q 또는 ESC → 종료
+  적응형 타이머:
+    - 세션 중 집중도 점수 누적
+    - 세션 종료 후 다음 세션 시간 추천
+
+Usage:
+  python step4_realtime.py
+  python step4_realtime.py --no-model   # Rule-based만 사용
 """
 
-import cv2
-import mediapipe as mp_lib
-import numpy as np
-import torch
-import torch.nn as nn
-import pickle
-import json
-import os
+import argparse
 import time
+import json
+import joblib
+import cv2
+import numpy as np
+import mediapipe as mp
+from pathlib import Path
 from collections import deque
-from PIL import ImageFont, ImageDraw, Image
 
-# ──────────────────────────────────────────────
-# 한글 폰트 설정 (macOS / Linux / Windows)
-# ──────────────────────────────────────────────
-FONT_PATHS = [
-    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
-    "/Library/Fonts/NanumGothic.ttf",
-    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-    "C:/Windows/Fonts/malgun.ttf",
-]
-_font_path = next((p for p in FONT_PATHS if os.path.exists(p)), None)
-
-def get_font(size=22):
-    if _font_path:
-        return ImageFont.truetype(_font_path, size)
-    return ImageFont.load_default()
-
-def put_kr_text(frame, text, pos, font_size=22, color=(255,255,255), bg=None):
-    """OpenCV 프레임에 한글 텍스트를 렌더링합니다."""
-    img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    draw    = ImageDraw.Draw(img_pil)
-    font    = get_font(font_size)
-
-    x, y = pos
-    if bg is not None:
-        bbox = font.getbbox(text)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.rectangle([x-4, y-4, x+tw+4, y+th+4], fill=bg)
-
-    draw.text((x, y), text, font=font, fill=color)
-    frame[:] = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-
-# ──────────────────────────────────────────────
-# 경로 설정
-# ──────────────────────────────────────────────
-BASE_DIR       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH     = os.path.join(BASE_DIR, "models", "best_model_finetuned.pt")
-SCALER_PATH    = os.path.join(BASE_DIR, "data", "features", "scaler.pkl")
-THRESHOLD_PATH = os.path.join(BASE_DIR, "models", "threshold.json")
-
-# ──────────────────────────────────────────────
-# 모델 설정 (step3_train.py와 일치)
-# ──────────────────────────────────────────────
-SEQ_LEN     = 90
-N_FEATURES  = 14    # 원시 8 (ear_avg,ear_l,ear_r,mar,pitch,yaw,roll,face_det) + 시간적 6
-HIDDEN_SIZE = 64
-NUM_LAYERS  = 1
-DROPOUT     = 0.4
-N_CLASSES   = 2
-
-# 집중도 판정
-DECISION_WINDOW = 30
-
-# 적응형 세션 기본값 (초)
-DEFAULT_SESSION_MINUTES = 25
-DEFAULT_BREAK_MINUTES   = 5
-MAX_SESSION_MINUTES     = 40
-MIN_SESSION_MINUTES     = 15
-MAX_BREAK_MINUTES       = 10
-MIN_BREAK_MINUTES       = 3
-
-# ──────────────────────────────────────────────
-# MediaPipe 랜드마크 인덱스
-# ──────────────────────────────────────────────
-LEFT_EYE_EAR  = [362, 385, 387, 263, 373, 380]
-RIGHT_EYE_EAR = [33,  160, 158, 133, 153, 144]
-MOUTH_MAR     = [61, 291, 0, 17]
-NOSE_TIP, CHIN, LEFT_EYE_C, RIGHT_EYE_C, LEFT_MOUTH, RIGHT_MOUTH = 1, 152, 263, 33, 287, 57
-
-# 시간적 특징 설정
-TEMPORAL_WINDOW = 30
-EAR_BLINK_THRESHOLD = 0.2
-
-# ──────────────────────────────────────────────
-# 특징 계산 (step1과 동일)
-# ──────────────────────────────────────────────
-
-def compute_ear(landmarks, indices):
-    pts = np.array([[landmarks[i].x, landmarks[i].y] for i in indices])
-    A = np.linalg.norm(pts[1] - pts[5])
-    B = np.linalg.norm(pts[2] - pts[4])
-    C = np.linalg.norm(pts[0] - pts[3])
-    return (A + B) / (2.0 * C + 1e-6)
-
-def compute_mar(landmarks):
-    pts = np.array([[landmarks[i].x, landmarks[i].y] for i in MOUTH_MAR])
-    return np.linalg.norm(pts[2] - pts[3]) / (np.linalg.norm(pts[0] - pts[1]) + 1e-6)
-
-def compute_head_pose(landmarks, img_w, img_h):
-    face_3d = np.array([
-        [0.0, 0.0, 0.0], [0.0, -330.0, -65.0],
-        [-225.0, 170.0, -135.0], [225.0, 170.0, -135.0],
-        [-150.0, -150.0, -125.0], [150.0, -150.0, -125.0],
-    ], dtype=np.float64)
-    key_pts = [NOSE_TIP, CHIN, LEFT_EYE_C, RIGHT_EYE_C, LEFT_MOUTH, RIGHT_MOUTH]
-    face_2d = np.array(
-        [[landmarks[i].x * img_w, landmarks[i].y * img_h] for i in key_pts],
-        dtype=np.float64
-    )
-    focal = img_w
-    cam_matrix = np.array([[focal, 0, img_w/2], [0, focal, img_h/2], [0, 0, 1]], dtype=np.float64)
-    success, rot_vec, _ = cv2.solvePnP(face_3d, face_2d, cam_matrix, np.zeros((4,1)))
-    if not success:
-        return 0.0, 0.0, 0.0
-    rot_mat, _ = cv2.Rodrigues(rot_vec)
-    angles, *_ = cv2.RQDecomp3x3(rot_mat)
-    pitch = float(np.clip(angles[0] * 360, -90.0, 90.0))
-    yaw   = float(np.clip(angles[1] * 360, -90.0, 90.0))
-    roll  = float(np.clip(angles[2] * 360, -90.0, 90.0))
-    return pitch, yaw, roll
+# step1, step2의 함수 재사용
+from step1_extract_features import (
+    compute_ear, compute_mar, compute_head_pose, compute_gaze_offset,
+    LEFT_EYE, RIGHT_EYE, mp_face_mesh
+)
+from step2_prepare_dataset import compute_clip_features
 
 
-def compute_temporal_features_realtime(raw_buffer: deque, mar_buffer: deque,
-                                        window: int = TEMPORAL_WINDOW) -> np.ndarray:
-    """
-    실시간 버퍼에서 현재 프레임의 시간적 통계 특징을 계산합니다.
+# ── 설정 ────────────────────────────────────────────────────────
 
-    입력:
-        raw_buffer — deque of (7,) arrays [ear_avg, ear_l, ear_r, pitch, yaw, roll, face_detected]
-        mar_buffer — deque of float (MAR 값, mar_std 계산용)
-    출력: (6,) array — [ear_std, mar_std, pitch_std, yaw_std, blink_rate, head_move_mag]
-    """
-    buf = list(raw_buffer)
-    n = len(buf)
-    start = max(0, n - window)
-    window_data = np.array(buf[start:], dtype=np.float32)
+class Config:
+    # Rule-based thresholds (졸음)
+    EAR_CLOSE_THRESHOLD = 0.20    # 눈 감김 판단
+    EAR_CLOSE_DURATION = 3.0      # 연속 N초 이상이면 졸음
+    MAR_YAWN_THRESHOLD = 0.65     # 하품 판단
+    MAR_YAWN_FRAMES = 5           # N프레임 이상 지속이면 하품
 
-    ear_avg = window_data[:, 0]
-    mar     = np.array(list(mar_buffer)[start:], dtype=np.float32)
-    pitch   = window_data[:, 4]   # idx: ear_avg=0,ear_l=1,ear_r=2,mar=3,pitch=4
-    yaw     = window_data[:, 5]   # idx: yaw=5
+    # 비집중 감지 thresholds (지속 시간 기반)
+    HEAD_TURN_YAW = 28.0          # 고개 돌림 판단 각도 (도)
+    HEAD_TURN_DURATION = 15.0     # N초 이상 지속되면 비집중
+    NO_FACE_ABSENT = 30.0         # 얼굴 미감지 N초 이상 → 자리 이탈
+    STARE_BLINK_WINDOW = 30.0     # 멍때리기 판단 윈도우 (초)
+    STARE_BLINK_MIN = 2           # 윈도우 내 최소 눈깜빡임 횟수 (이하면 멍때리기)
 
-    temporal = np.zeros(6, dtype=np.float32)
-    temporal[0] = np.std(ear_avg)
-    temporal[1] = np.std(mar)
-    temporal[2] = np.std(pitch)
-    temporal[3] = np.std(yaw)
-    temporal[4] = np.sum(ear_avg < EAR_BLINK_THRESHOLD) / len(ear_avg)
+    # ML 판단 주기
+    ML_WINDOW_SEC = 3.0           # 최근 N초 데이터로 ML 판단
+    ML_INTERVAL_SEC = 1.0         # N초마다 ML 추론
 
-    if len(pitch) > 1:
-        temporal[5] = np.mean(np.abs(np.diff(pitch))) + np.mean(np.abs(np.diff(yaw)))
+    # 적응형 타이머
+    DEFAULT_FOCUS_MIN = 25        # 기본 집중 세션 (분)
+    DEFAULT_BREAK_MIN = 5         # 기본 휴식 (분)
+    MIN_FOCUS_MIN = 25            # 최소 집중 세션
+    MAX_FOCUS_MIN = 50            # 최대 집중 세션
+    FOCUS_ADJUST_STEP = 5         # 조절 단위 (분)
 
-    return temporal
-
-
-# ──────────────────────────────────────────────
-# GRU 모델 정의 (step3_train.py와 동일 구조)
-# ──────────────────────────────────────────────
-
-class ConcentrationGRU(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.gru = nn.GRU(
-            N_FEATURES, HIDDEN_SIZE, NUM_LAYERS,
-            batch_first=True,
-            dropout=DROPOUT if NUM_LAYERS > 1 else 0,
-        )
-        self.attention = nn.Sequential(
-            nn.Linear(HIDDEN_SIZE, 32),
-            nn.Tanh(),
-            nn.Linear(32, 1),
-        )
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(HIDDEN_SIZE),
-            nn.Dropout(DROPOUT),
-            nn.Linear(HIDDEN_SIZE, 32),
-            nn.GELU(),
-            nn.Dropout(DROPOUT * 0.5),
-            nn.Linear(32, N_CLASSES),
-        )
-
-    def forward(self, x):
-        gru_out, _ = self.gru(x)
-        attn_weights = torch.softmax(self.attention(gru_out), dim=1)
-        context = (gru_out * attn_weights).sum(dim=1)
-        return self.classifier(context)
+    # 집중도 점수 가중치 (합계 = 1.0)
+    W_ML = 0.50                   # ML 판단 (졸음 여부)
+    W_PRESENCE = 0.20             # 자리 이탈 없음
+    W_HEAD = 0.20                 # 고개 정면 유지
+    W_STARE = 0.10                # 멍때리기 없음
 
 
-# ──────────────────────────────────────────────
-# 적응형 세션 추천 로직
-# ──────────────────────────────────────────────
+# ── Rule-based 판단기 ───────────────────────────────────────────
 
-FACE_ABSENT_THRESHOLD = 30   # 초
+class RuleBasedDetector:
+    """확정적 비집중 신호 감지"""
 
-class AdaptiveSessionAdvisor:
-    """
-    실시간 집중도를 기반으로 다음 세션과 휴식 시간을 동적으로 조절합니다.
+    def __init__(self, fps=30):
+        self.fps = fps
+        self.eye_close_frames = 0
+        self.yawn_frames = 0
+        self.no_face_frames = 0
 
-    핵심 로직:
-      - 세션 중 평균 집중도를 추적
-      - 세션 종료 시 집중도에 따라 다음 세션/휴식 시간을 조절
-        - 집중도 >= 70%: 다음 세션 +5분, 휴식 +1분
-        - 집중도 40~70%: 기본 세션/휴식 유지
-        - 집중도 < 40%: 다음 세션 -5분, 휴식 +2분
-    """
-    def __init__(self):
-        self.state = "idle"               # idle / focusing / resting
-        self.session_start = None
-        self.rest_start    = None
-        self.absent_start  = None
+    def update(self, ear_avg, mar, face_detected):
+        """프레임 단위 업데이트. 졸음 신호가 있으면 reason 리스트 반환, 없으면 None"""
+        reasons = []
 
-        # 적응형 세션 시간 (초)
-        self.current_session_sec = DEFAULT_SESSION_MINUTES * 60
-        self.current_break_sec   = DEFAULT_BREAK_MINUTES * 60
-
-        # 세션 중 집중도 추적
-        self.session_focus_samples = []
-
-        self.recommendation = ""
-        self.completed_sessions = 0
-
-    def _adapt_times(self, avg_focus: float):
-        """세션 종료 후 다음 세션/휴식 시간을 조절합니다."""
-        if avg_focus >= 0.70:
-            # 고집중 → 세션 연장, 휴식 약간 추가
-            self.current_session_sec = min(
-                self.current_session_sec + 5 * 60,
-                MAX_SESSION_MINUTES * 60
-            )
-            self.current_break_sec = min(
-                self.current_break_sec + 1 * 60,
-                MAX_BREAK_MINUTES * 60
-            )
-        elif avg_focus < 0.40:
-            # 저집중 → 세션 단축, 휴식 추가
-            self.current_session_sec = max(
-                self.current_session_sec - 5 * 60,
-                MIN_SESSION_MINUTES * 60
-            )
-            self.current_break_sec = min(
-                self.current_break_sec + 2 * 60,
-                MAX_BREAK_MINUTES * 60
-            )
-        # 40~70%: 현재 설정 유지
-
-    def update(self, is_focused: bool, face_detected: bool, current_time: float) -> str:
-
-        # ── 얼굴 미검출 처리 ─────────────────────────
         if not face_detected:
-            if self.absent_start is None:
-                self.absent_start = current_time
+            self.eye_close_frames = 0
+            self.yawn_frames = 0
+            return None
 
-            absent_sec = current_time - self.absent_start
-            if absent_sec < FACE_ABSENT_THRESHOLD:
-                self.recommendation = f"잠시 자리를 비웠어요 ({int(absent_sec)}초) - 세션 유지 중"
-                return self.recommendation
-            else:
-                if self.state == "focusing":
-                    self._end_session()
-                if self.state != "resting":
-                    self.state      = "resting"
-                    self.rest_start = current_time
-                elapsed = current_time - (self.rest_start or current_time)
-                self.recommendation = (
-                    f"자리 비움 {int(elapsed + FACE_ABSENT_THRESHOLD)}초 - 휴식으로 전환\n"
-                    f"  다음 세션: {self.current_session_sec // 60}분"
-                )
-                return self.recommendation
+        # 눈 감김 (졸음)
+        if ear_avg < Config.EAR_CLOSE_THRESHOLD:
+            self.eye_close_frames += 1
+            if self.eye_close_frames >= self.fps * Config.EAR_CLOSE_DURATION:
+                reasons.append("eyes_closed")
         else:
-            self.absent_start = None
+            self.eye_close_frames = 0
 
-        # ── 집중 / 비집중 판정 ───────────────────────
-        if is_focused:
-            if self.state != "focusing":
-                self.state = "focusing"
-                self.session_start = current_time
-                self.session_focus_samples = []
-
-            self.session_focus_samples.append(1.0)
-            elapsed = current_time - self.session_start
-
-            if elapsed >= self.current_session_sec:
-                avg_focus = np.mean(self.session_focus_samples)
-                self._end_session()
-                self._adapt_times(avg_focus)
-                self.state      = "resting"
-                self.rest_start = current_time
-                self.recommendation = (
-                    f"세션 완료! (집중도: {avg_focus*100:.0f}%)\n"
-                    f"  휴식 {self.current_break_sec // 60}분 추천\n"
-                    f"  다음 세션: {self.current_session_sec // 60}분"
-                )
-            else:
-                remain = self.current_session_sec - elapsed
-                avg_focus = np.mean(self.session_focus_samples) if self.session_focus_samples else 0
-                self.recommendation = (
-                    f"집중 중 | 남은 시간: {int(remain//60)}분 {int(remain%60)}초\n"
-                    f"  현재 세션 집중도: {avg_focus*100:.0f}%"
-                )
+        # 하품
+        if mar > Config.MAR_YAWN_THRESHOLD:
+            self.yawn_frames += 1
+            if self.yawn_frames >= Config.MAR_YAWN_FRAMES:
+                reasons.append("yawning")
         else:
-            if self.state == "focusing":
-                self.session_focus_samples.append(0.0)
-                elapsed = current_time - self.session_start
+            self.yawn_frames = 0
 
-                # 세션 도중 비집중이면 기록은 하되 세션 유지
-                if elapsed >= self.current_session_sec:
-                    avg_focus = np.mean(self.session_focus_samples)
-                    self._end_session()
-                    self._adapt_times(avg_focus)
-                    self.state      = "resting"
-                    self.rest_start = current_time
-                    self.recommendation = (
-                        f"세션 완료! (집중도: {avg_focus*100:.0f}%)\n"
-                        f"  휴식 {self.current_break_sec // 60}분 추천\n"
-                        f"  다음 세션: {self.current_session_sec // 60}분"
-                    )
-                else:
-                    remain = self.current_session_sec - elapsed
-                    avg_focus = np.mean(self.session_focus_samples)
-                    self.recommendation = (
-                        f"집중이 흐트러지고 있어요 | 남은 시간: {int(remain//60)}분 {int(remain%60)}초\n"
-                        f"  현재 세션 집중도: {avg_focus*100:.0f}%"
-                    )
-            else:
-                # 휴식 상태
-                if self.state != "resting":
-                    self.state      = "resting"
-                    self.rest_start = current_time
-
-                elapsed = current_time - (self.rest_start or current_time)
-                if elapsed >= self.current_break_sec:
-                    self.recommendation = (
-                        f"충분히 쉬었어요! 다시 시작해 볼까요?\n"
-                        f"  다음 세션: {self.current_session_sec // 60}분"
-                    )
-                else:
-                    remain = self.current_break_sec - elapsed
-                    self.recommendation = f"휴식 중 | 남은 시간: {int(remain//60)}분 {int(remain%60)}초"
-
-        return self.recommendation
-
-    def _end_session(self):
-        self.completed_sessions += 1
-        self.session_start = None
-        self.session_focus_samples = []
-
-    def get_status_summary(self) -> str:
-        session_min = self.current_session_sec // 60
-        break_min   = self.current_break_sec // 60
-        return f"세션: {session_min}분 | 휴식: {break_min}분 | 완료: {self.completed_sessions}회"
+        return reasons if reasons else None
 
 
-# ──────────────────────────────────────────────
-# 화면 렌더링
-# ──────────────────────────────────────────────
+# ── 비집중 감지기 (지속 시간 기반) ─────────────────────────────
 
-def draw_bar(frame, label, value, x, y, w=200, h=18, color=(0,200,100)):
-    cv2.rectangle(frame, (x, y), (x+w, y+h), (60,60,60), -1)
-    cv2.rectangle(frame, (x, y), (x+int(w*min(value,1.0)), y+h), color, -1)
-    put_kr_text(frame, f"{label}: {value:.2f}", (x, y - 22), font_size=18, color=(220,220,220))
+class DistractionDetector:
+    """
+    공부 중 비집중 신호를 지속 시간 기반으로 감지.
+    순간 판단이 아닌 N초 이상 지속될 때만 비집중으로 판단.
+    """
+
+    def __init__(self, fps=30):
+        self.fps = fps
+
+        # 고개 돌림 추적
+        self.head_turn_frames = 0
+
+        # 자리 이탈 추적
+        self.no_face_frames = 0
+
+        # 멍때리기 추적 (윈도우 내 눈깜빡임 횟수)
+        self.blink_window = deque()   # (timestamp, is_blink) 저장
+        self.prev_ear_closed = False
+        self.blink_count_window = 0
+
+    def update(self, face_detected, yaw, ear_avg, timestamp):
+        """
+        매 프레임 업데이트.
+        반환: dict {signal: bool} — 각 비집중 신호 활성화 여부
+        """
+        signals = {
+            'head_turned': False,   # 고개 장시간 돌림
+            'absent':      False,   # 자리 이탈
+            'staring':     False,   # 멍때리기
+        }
+
+        # ── 자리 이탈 ──
+        if not face_detected:
+            self.no_face_frames += 1
+            if self.no_face_frames >= self.fps * Config.NO_FACE_ABSENT:
+                signals['absent'] = True
+        else:
+            self.no_face_frames = 0
+
+        if not face_detected:
+            return signals
+
+        # ── 고개 장시간 돌림 ──
+        if abs(yaw) > Config.HEAD_TURN_YAW:
+            self.head_turn_frames += 1
+            if self.head_turn_frames >= self.fps * Config.HEAD_TURN_DURATION:
+                signals['head_turned'] = True
+        else:
+            self.head_turn_frames = max(0, self.head_turn_frames - 2)  # 서서히 감소
+
+        # ── 멍때리기: 윈도우 내 눈깜빡임 부족 ──
+        ear_closed = ear_avg < Config.EAR_CLOSE_THRESHOLD
+        is_blink = (not self.prev_ear_closed) and ear_closed  # 눈 감기는 순간
+        self.prev_ear_closed = ear_closed
+
+        # 윈도우 내 깜빡임 기록
+        self.blink_window.append((timestamp, is_blink))
+        if is_blink:
+            self.blink_count_window += 1
+
+        # 오래된 기록 제거
+        cutoff = timestamp - Config.STARE_BLINK_WINDOW
+        while self.blink_window and self.blink_window[0][0] < cutoff:
+            _, old_blink = self.blink_window.popleft()
+            if old_blink:
+                self.blink_count_window -= 1
+
+        # 윈도우가 충분히 찼을 때만 멍때리기 판단
+        window_full = (len(self.blink_window) >= self.fps * Config.STARE_BLINK_WINDOW * 0.8)
+        if window_full and self.blink_count_window <= Config.STARE_BLINK_MIN:
+            signals['staring'] = True
+
+        return signals
 
 
-# ──────────────────────────────────────────────
-# 메인 루프
-# ──────────────────────────────────────────────
+# ── ML 판단기 ───────────────────────────────────────────────────
 
-def main():
-    # 디바이스
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+class MLDetector:
+    """XGBoost 모델 기반 집중도 판단"""
 
-    # 모델 & Scaler 로드
-    model = ConcentrationGRU().to(device)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
-    model.eval()
+    def __init__(self, model_path, threshold_path):
+        self.model = joblib.load(model_path)
 
-    with open(SCALER_PATH, "rb") as f:
-        scaler = pickle.load(f)
+        with open(threshold_path) as f:
+            config = json.load(f)
+        self.threshold = config['threshold']
 
-    # threshold 로드
-    FOCUSED_THRESHOLD = 0.5
-    if os.path.exists(THRESHOLD_PATH):
-        with open(THRESHOLD_PATH, "r") as f:
-            thresh_data = json.load(f)
-        FOCUSED_THRESHOLD = thresh_data.get("focused_threshold", 0.5)
-        print(f"threshold 로드: P(집중) >= {FOCUSED_THRESHOLD} → 집중 판정")
-    else:
-        print(f"threshold.json 없음 → 기본값 {FOCUSED_THRESHOLD} 사용")
+        print(f"[ML] Model loaded, threshold={self.threshold:.2f}")
 
-    print("모델 로드 완료! 카메라 시작 중...")
+    def predict(self, frame_buffer):
+        """
+        frame_buffer: deque of feature vectors (N, 10)
+        반환: (is_focused: bool, confidence: float)
+        """
+        if len(frame_buffer) < 10:
+            return True, 0.5  # 데이터 부족 시 기본 집중
 
-    # MediaPipe
-    face_mesh = mp_lib.solutions.face_mesh.FaceMesh(
-        static_image_mode=False, max_num_faces=1,
-        refine_landmarks=True, min_detection_confidence=0.5
-    )
+        frames = np.array(list(frame_buffer), dtype=np.float32)
+        clip_feats, _ = compute_clip_features(frames)
 
+        if clip_feats is None:
+            return True, 0.5
+
+        # feature dict → numpy array (feature_names 순서대로)
+        from step2_prepare_dataset import _get_feature_names
+        feature_names = _get_feature_names()
+        X = np.array([[clip_feats.get(name, 0.0) for name in feature_names]],
+                     dtype=np.float32)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        proba = self.model.predict_proba(X)[0]
+        p_alert = proba[1]
+        is_focused = p_alert >= self.threshold
+
+        return is_focused, float(p_alert)
+
+
+# ── 적응형 타이머 ───────────────────────────────────────────────
+
+class AdaptiveTimer:
+    """세션 집중도에 따라 다음 세션 시간 추천"""
+
+    def __init__(self):
+        self.current_focus_min = Config.DEFAULT_FOCUS_MIN
+        self.current_break_min = Config.DEFAULT_BREAK_MIN
+        self.session_scores = []  # 각 세션의 평균 집중도
+
+    def record_session(self, avg_focus_score):
+        """세션 종료 시 집중도 점수 기록 (0~1)"""
+        self.session_scores.append(avg_focus_score)
+
+    def recommend_next(self):
+        """다음 세션 시간 추천"""
+        if not self.session_scores:
+            return self.current_focus_min, self.current_break_min
+
+        last_score = self.session_scores[-1]
+
+        if last_score >= 0.7:
+            # 집중 잘 함 → 세션 시간 늘리기
+            self.current_focus_min = min(
+                self.current_focus_min + Config.FOCUS_ADJUST_STEP,
+                Config.MAX_FOCUS_MIN
+            )
+            self.current_break_min = 5
+            msg = f"Great focus! Next: {self.current_focus_min}min study + {self.current_break_min}min break"
+        elif last_score >= 0.4:
+            # 보통 → 유지
+            msg = f"Not bad! Keeping {self.current_focus_min}min study + {self.current_break_min}min break"
+        else:
+            # 집중 못함 → 세션 줄이기, 휴식 늘리기
+            self.current_focus_min = max(
+                self.current_focus_min - Config.FOCUS_ADJUST_STEP,
+                Config.MIN_FOCUS_MIN
+            )
+            self.current_break_min = 10
+            msg = f"Tough session! Next: {self.current_focus_min}min study + {self.current_break_min}min break"
+
+        return self.current_focus_min, self.current_break_min, msg
+
+
+# ── 메인 실시간 루프 ────────────────────────────────────────────
+
+def compute_focus_score(ml_focused, distraction_signals, rule_reasons):
+    """
+    가중치 기반 집중도 점수 계산 (0.0 ~ 1.0)
+
+    ML(졸음 여부) × 0.5
+    + 자리 이탈 없음  × 0.2
+    + 고개 정면 유지  × 0.2
+    + 멍때리기 없음   × 0.1
+    """
+    # 졸음/눈감김/하품 감지 시 ML 점수 0
+    is_drowsy = bool(rule_reasons)
+    ml_score = Config.W_ML * (1.0 if (ml_focused and not is_drowsy) else 0.0)
+
+    presence_score = Config.W_PRESENCE * (0.0 if distraction_signals.get('absent') else 1.0)
+    head_score     = Config.W_HEAD     * (0.0 if distraction_signals.get('head_turned') else 1.0)
+    stare_score    = Config.W_STARE    * (0.0 if distraction_signals.get('staring') else 1.0)
+
+    return ml_score + presence_score + head_score + stare_score
+
+
+def run_realtime(use_model=True):
+    """웹캠 기반 실시간 집중도 모니터링"""
+    base = Path(__file__).resolve().parent.parent
+
+    # 감지기 초기화
+    fps = 30
+    rule_detector = RuleBasedDetector(fps=fps)
+    distraction_detector = DistractionDetector(fps=fps)
+    ml_detector = None
+
+    if use_model:
+        model_path = base / "models" / "xgb_model.joblib"
+        threshold_path = base / "models" / "threshold.json"
+        if model_path.exists() and threshold_path.exists():
+            ml_detector = MLDetector(model_path, threshold_path)
+        else:
+            print("[WARN] Model files not found. Using rule-based only.")
+
+    timer = AdaptiveTimer()
+
+    # 프레임 버퍼 (ML 판단용)
+    buffer_size = int(Config.ML_WINDOW_SEC * fps)
+    frame_buffer = deque(maxlen=buffer_size)
+
+    # 세션 상태
+    focus_scores = []
+    session_start = time.time()
+    last_ml_time = time.time()
+    ml_focused = True
+    ml_confidence = 0.5
+    distraction_signals = {'head_turned': False, 'absent': False, 'staring': False}
+
+    # 상태 안정화: 3번 연속 같은 결과여야 화면에 반영
+    ml_history = deque(maxlen=3)
+    stable_ml_focused = True
+
+    # 카메라
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("카메라를 열 수 없습니다.")
+        print("[ERROR] Cannot open camera")
         return
 
-    # 버퍼
-    raw_buffer    = deque(maxlen=SEQ_LEN + TEMPORAL_WINDOW)  # 원시 특징 (시간적 계산용 여유)
-    mar_buffer    = deque(maxlen=SEQ_LEN + TEMPORAL_WINDOW)  # MAR 값 (mar_std 계산용)
-    full_buffer   = deque(maxlen=SEQ_LEN)    # 13-dim 전체 특징 시퀀스
-    pred_buffer   = deque(maxlen=DECISION_WINDOW)
-    advisor       = AdaptiveSessionAdvisor()
+    print("\n" + "="*50)
+    print("  Adaptive Pomodoro - Real-time Monitor")
+    print("  Focused: Green / Drowsy: Red / Distracted: Orange")
+    print("  Press 'q' to quit, 's' to end session")
+    print("="*50)
 
-    pred_label    = "대기 중..."
-    focus_ratio   = 0.0
-    confidence    = 0.0
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    ) as face_mesh:
 
-    SESSION_FOCUS_THRESHOLD = 0.6
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-    print("실행 중... Q 또는 ESC로 종료")
+            now = time.time()
+            img_h, img_w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+            # ── Feature 추출 ──
+            if results.multi_face_landmarks:
+                lm = results.multi_face_landmarks[0].landmark
+                ear_l = compute_ear(lm, LEFT_EYE)
+                ear_r = compute_ear(lm, RIGHT_EYE)
+                ear_avg = (ear_l + ear_r) / 2
+                mar = compute_mar(lm)
+                pitch, yaw, roll = compute_head_pose(lm, img_w, img_h)
+                gaze_h, gaze_v = compute_gaze_offset(lm, img_w, img_h)
+                face_detected = True
+                feat_vec = [ear_l, ear_r, ear_avg, mar,
+                            pitch, yaw, roll, gaze_h, gaze_v, 1.0]
+            else:
+                ear_avg = mar = yaw = 0.0
+                face_detected = False
+                feat_vec = [0.0] * 9 + [0.0]
 
-        h, w = frame.shape[:2]
-        rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = face_mesh.process(rgb)
+            frame_buffer.append(feat_vec)
 
-        face_detected = False
-        if result.multi_face_landmarks:
-            face_detected = True
-            lm = result.multi_face_landmarks[0].landmark
+            # ── 1층: 졸음 rule-based ──
+            rule_reasons = rule_detector.update(ear_avg, mar, face_detected)
 
-            ear_l = compute_ear(lm, LEFT_EYE_EAR)
-            ear_r = compute_ear(lm, RIGHT_EYE_EAR)
-            mar   = compute_mar(lm)
-            pitch, yaw, roll = compute_head_pose(lm, w, h)
+            # ── 2층: 비집중 감지 (지속 시간 기반) ──
+            distraction_signals = distraction_detector.update(
+                face_detected, yaw, ear_avg, now
+            )
 
-            # [ear_avg, ear_l, ear_r, pitch, yaw, roll, face_detected] — MAR raw 제외
-            raw_feat = np.array([(ear_l+ear_r)/2, ear_l, ear_r, mar, pitch, yaw, roll, 1.0],
-                                dtype=np.float32)
-            raw_buffer.append(raw_feat)
-            mar_buffer.append(mar)
+            # ── 3층: ML (주기적) ──
+            if ml_detector and (now - last_ml_time) >= Config.ML_INTERVAL_SEC:
+                ml_focused, ml_confidence = ml_detector.predict(frame_buffer)
+                ml_history.append(ml_focused)
+                # 3번 연속 같은 결과일 때만 상태 변경
+                if len(ml_history) == 3 and all(v == ml_history[0] for v in ml_history):
+                    stable_ml_focused = ml_history[0]
+                last_ml_time = now
 
-            # 시간적 특징 계산
-            temporal_feat = compute_temporal_features_realtime(raw_buffer, mar_buffer)
-            full_feat = np.concatenate([raw_feat, temporal_feat])  # (14,)
-            full_buffer.append(full_feat)
+            # ── 집중도 점수 계산 ──
+            score = compute_focus_score(stable_ml_focused, distraction_signals, rule_reasons)
+            focus_scores.append(score)
 
-            # 얼굴 랜드마크 그리기
-            for idx in LEFT_EYE_EAR + RIGHT_EYE_EAR + MOUTH_MAR:
-                cx, cy = int(lm[idx].x * w), int(lm[idx].y * h)
-                cv2.circle(frame, (cx, cy), 2, (0, 255, 180), -1)
-        else:
-            raw_buffer.append(np.zeros(8, dtype=np.float32))
-            mar_buffer.append(0.0)
-            full_buffer.append(np.zeros(N_FEATURES, dtype=np.float32))
+            # ── 상태 텍스트 & 색상 결정 ──
+            if rule_reasons:
+                status_text = f"DROWSY ({', '.join(rule_reasons)})"
+                color = (0, 0, 255)       # 빨강
+            elif distraction_signals.get('absent'):
+                status_text = "ABSENT (away from desk)"
+                color = (0, 0, 200)       # 진빨강
+            elif distraction_signals.get('head_turned'):
+                status_text = "DISTRACTED (head turned)"
+                color = (0, 140, 255)     # 주황
+            elif distraction_signals.get('staring'):
+                status_text = "DISTRACTED (spacing out)"
+                color = (0, 165, 255)     # 연주황
+            elif not stable_ml_focused:
+                status_text = f"DROWSY (ML, conf:{ml_confidence:.2f})"
+                color = (0, 80, 255)      # 빨강 계열
+            else:
+                status_text = f"FOCUSED (conf:{ml_confidence:.2f})"
+                color = (0, 200, 80)      # 초록
 
-        # SEQ_LEN 프레임 쌓이면 추론
-        if len(full_buffer) == SEQ_LEN:
-            seq = np.array(full_buffer, dtype=np.float32)          # (90, 14)
-            seq_scaled = scaler.transform(seq).astype(np.float32)
-            x = torch.tensor(seq_scaled[np.newaxis], dtype=torch.float32).to(device)
+            # ── 화면 표시 ──
+            elapsed = now - session_start
+            elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
 
-            with torch.no_grad():
-                logits = model(x)
-                probs  = torch.softmax(logits, dim=1)[0].cpu().numpy()
+            cv2.putText(frame, status_text, (10, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+            cv2.putText(frame, f"Time: {elapsed_str}", (10, 68),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-            confidence = float(probs[1])
-            pred       = 1 if confidence >= FOCUSED_THRESHOLD else 0
-            pred_buffer.append(pred)
+            if face_detected:
+                cv2.putText(frame,
+                            f"EAR:{ear_avg:.2f}  MAR:{mar:.2f}  Yaw:{yaw:.1f}",
+                            (10, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                            (200, 200, 200), 1)
 
-            focus_ratio = sum(pred_buffer) / len(pred_buffer)
-            is_focused  = focus_ratio >= SESSION_FOCUS_THRESHOLD
-            pred_label  = "집중" if is_focused else "비집중"
-            advisor.update(is_focused, face_detected, time.time())
+            # 집중도 점수 바 (최근 30초)
+            recent = focus_scores[-fps * 30:]
+            if recent:
+                recent_score = np.mean(recent)
+                bar_w = int(200 * recent_score)
+                cv2.rectangle(frame, (10, img_h - 45), (210, img_h - 15),
+                              (50, 50, 50), -1)
+                bar_color = (0, 200, 80) if recent_score >= 0.7 else \
+                            (0, 165, 255) if recent_score >= 0.4 else (0, 0, 255)
+                cv2.rectangle(frame, (10, img_h - 45), (10 + bar_w, img_h - 15),
+                              bar_color, -1)
+                cv2.putText(frame, f"Focus: {recent_score:.0%}",
+                            (220, img_h - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (255, 255, 255), 1)
 
-        # ── UI 렌더링 ──────────────────────────────────────
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 130), (20, 20, 20), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+            cv2.imshow('Adaptive Pomodoro', frame)
 
-        # 상태 텍스트
-        label_color = (80, 220, 80) if pred_label == "집중" else (80, 80, 240)
-        put_kr_text(frame, pred_label, (15, 8), font_size=26, color=label_color, bg=(20,20,20))
-
-        # 세션 요약 (우상단)
-        status = advisor.get_status_summary()
-        put_kr_text(frame, status, (w - 350, 8), font_size=16, color=(180, 180, 180), bg=(20,20,20))
-
-        # 집중도 바
-        draw_bar(frame, "집중도", focus_ratio, x=15, y=68,  color=(80,200,80))
-        draw_bar(frame, "확률  ", confidence,  x=15, y=105, color=(80,150,220))
-
-        # 세션 추천 (하단)
-        if advisor.recommendation:
-            lines = advisor.recommendation.split('\n')
-            for i, line in enumerate(lines):
-                put_kr_text(frame, line, (15, h - 60 + i * 25),
-                            font_size=18, color=(255, 220, 80), bg=(30, 30, 30))
-
-        # 얼굴 미검출 경고
-        if not face_detected:
-            put_kr_text(frame, "얼굴을 카메라에 맞춰주세요",
-                        (w//2-140, h//2), font_size=22, color=(80,80,240), bg=(20,20,20))
-
-        # 버퍼 수집 진행률
-        if len(full_buffer) < SEQ_LEN:
-            ratio = len(full_buffer) / SEQ_LEN
-            put_kr_text(frame, f"초기화 중... {int(ratio*100)}%",
-                        (15, h-70), font_size=18, color=(180,180,180), bg=(20,20,20))
-
-        cv2.imshow("Smartto - 적응형 뽀모도로", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord('q'), ord('Q'), 27):
-            break
+            # ── 키 입력 ──
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                if focus_scores:
+                    avg_score = np.mean(focus_scores)
+                    timer.record_session(avg_score)
+                    focus_min, break_min, msg = timer.recommend_next()
+                    print(f"\n[Session End] Avg focus score: {avg_score:.2f}")
+                    print(f"[Recommend] {msg}")
+                focus_scores = []
+                session_start = now
+                frame_buffer.clear()
 
     cap.release()
-    face_mesh.close()
     cv2.destroyAllWindows()
-    print("종료됨.")
+
+    if focus_scores:
+        avg_score = np.mean(focus_scores)
+        timer.record_session(avg_score)
+        focus_min, break_min, msg = timer.recommend_next()
+        print(f"\n[Final Session] Avg focus score: {avg_score:.2f}")
+        print(f"[Recommend] {msg}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--no-model', action='store_true',
+                        help='Rule-based only, no ML model')
+    args = parser.parse_args()
+
+    run_realtime(use_model=not args.no_model)
 
 
 if __name__ == "__main__":

@@ -8,14 +8,14 @@ dependencies:
   - numpy
   - pandas
   - matplotlib
-  - seaborn
   - tqdm
   - scikit-learn
   - jupyter
   - ipykernel
   - pip:
-    - torch
-    - torchvision
-    - torchaudio
     - mediapipe
     - opencv-python
+    - xgboost
+    - optuna
+    - imbalanced-learn
+    - joblib

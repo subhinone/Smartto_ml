@@ -1,1 +1,29 @@
-{"focused_threshold": 0.51, "val_f1_macro": 0.5913}
+{
+  "threshold": 0.49000000000000016,
+  "val_metrics": {
+    "f1_macro": 0.9267576931143584,
+    "recall_drowsy": 0.944172010562052,
+    "recall_alert": 0.9147344801795063,
+    "auc_roc": 0.980930411944294,
+    "accuracy": 0.9343029087261785
+  },
+  "test_metrics": {
+    "f1_macro": 0.9207502731387873,
+    "recall_drowsy": 0.9345794392523364,
+    "recall_alert": 0.9178707224334601,
+    "auc_roc": 0.9789650687608826,
+    "accuracy": 0.9290726817042606
+  },
+  "params": {
+    "n_estimators": 200,
+    "max_depth": 6,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
+    "min_child_weight": 3,
+    "gamma": 0.1,
+    "scale_pos_weight": 1.5
+  }
+}

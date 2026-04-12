@@ -1,411 +1,336 @@
 """
-Step 1: DAiSEE 데이터셋에서 MediaPipe로 특징 추출
-------------------------------------------------------
-프레임별 원시 특징 + 윈도우 기반 시간적 통계 특징을 추출합니다.
+Step 1: DAiSEE 영상에서 MediaPipe 기반 feature 추출
 
-원시 특징 (per-frame):
-    EAR (Eye Aspect Ratio), MAR (Mouth Aspect Ratio),
-    Head Pose (pitch, yaw, roll), face_detected
+Features (프레임 단위):
+  - EAR (Eye Aspect Ratio): left, right, avg
+  - MAR (Mouth Aspect Ratio)
+  - Head Pose: pitch, yaw, roll
+  - Gaze Direction: iris 기반 좌우/상하 시선 오프셋
+  - Face Detected: 얼굴 감지 여부 (0/1)
 
-시간적 통계 특징 (per-window):
-    ear_std, mar_std, pitch_std, yaw_std,
-    blink_rate, head_movement_magnitude
+Labeling (Drowsiness-oriented):
+  - Alert (1): Engagement >= 2 AND Boredom <= 1
+  - Drowsy/Unfocused (0): Engagement <= 1 OR Boredom >= 2
 
-레이블 전략 (다중 조건 이진화):
-    집중(1):  Engagement >= 2 AND Boredom <= 1 AND Confusion <= 1 AND Frustration <= 1
-    비집중(0): 그 외 모든 경우
-
-실행 방법:
-    python src/step1_extract_features.py
-
-출력:
-    data/features/train_features.npz
-    data/features/val_features.npz
-    data/features/test_features.npz
+Usage:
+  python step1_extract_features.py
 """
 
-import cv2
-import mediapipe as mp
-import numpy as np
-import pandas as pd
 import os
+import csv
+import cv2
+import numpy as np
+import mediapipe as mp
+from pathlib import Path
 from tqdm import tqdm
-import logging
 
-# ──────────────────────────────────────────────
-# 경로 설정
-# ──────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DAISEE_ROOT = os.path.join(BASE_DIR, "data", "DAiSEE", "DAiSEE")
-LABELS_DIR = os.path.join(DAISEE_ROOT, "Labels")
-DATASET_DIR = os.path.join(DAISEE_ROOT, "DataSet")
-OUTPUT_DIR = os.path.join(BASE_DIR, "data", "features")
+# ── MediaPipe 설정 ──────────────────────────────────────────────
+mp_face_mesh = mp.solutions.face_mesh
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# EAR 랜드마크 인덱스 (MediaPipe FaceMesh 468점 기준)
+LEFT_EYE = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE = [33, 160, 158, 133, 153, 144]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
+# MAR 랜드마크 인덱스
+MOUTH = [61, 291, 39, 181, 0, 17, 269, 405]
 
-# ──────────────────────────────────────────────
-# MediaPipe FaceMesh 랜드마크 인덱스 정의
-# ──────────────────────────────────────────────
-LEFT_EYE_EAR  = [362, 385, 387, 263, 373, 380]
-RIGHT_EYE_EAR = [33,  160, 158, 133, 153, 144]
-MOUTH_MAR = [61, 291, 0, 17]
+# Iris 랜드마크 (MediaPipe FaceMesh refine_landmarks=True)
+LEFT_IRIS = [468, 469, 470, 471, 472]
+RIGHT_IRIS = [473, 474, 475, 476, 477]
 
-NOSE_TIP     = 1
-CHIN         = 152
-LEFT_EYE_C   = 263
-RIGHT_EYE_C  = 33
-LEFT_MOUTH   = 287
-RIGHT_MOUTH  = 57
+# Head pose 추정용 3D 모델 포인트
+MODEL_POINTS = np.array([
+    (0.0, 0.0, 0.0),          # 코끝 (1)
+    (0.0, -330.0, -65.0),     # 턱 (152)
+    (-225.0, 170.0, -135.0),  # 왼쪽 눈 끝 (263)
+    (225.0, 170.0, -135.0),   # 오른쪽 눈 끝 (33)
+    (-150.0, -150.0, -125.0), # 왼쪽 입 끝 (287)
+    (150.0, -150.0, -125.0),  # 오른쪽 입 끝 (57)
+], dtype=np.float64)
 
-# ──────────────────────────────────────────────
-# 시간적 특징 설정
-# ──────────────────────────────────────────────
-TEMPORAL_WINDOW = 30          # 통계 계산 윈도우 (프레임)
-EAR_BLINK_THRESHOLD = 0.2    # EAR이 이 값 이하면 눈 감김(blink) 판정
+FACE_2D_IDX = [1, 152, 263, 33, 287, 57]
 
-# ──────────────────────────────────────────────
-# 특징 계산 함수
-# ──────────────────────────────────────────────
+# ── Feature 계산 함수들 ─────────────────────────────────────────
 
-def compute_ear(landmarks, indices):
-    """Eye Aspect Ratio: 눈 감김 정도 (낮을수록 졸림)"""
-    pts = np.array([[landmarks[i].x, landmarks[i].y] for i in indices])
-    A = np.linalg.norm(pts[1] - pts[5])
-    B = np.linalg.norm(pts[2] - pts[4])
-    C = np.linalg.norm(pts[0] - pts[3])
-    return (A + B) / (2.0 * C + 1e-6)
+def compute_ear(landmarks, eye_indices):
+    """Eye Aspect Ratio 계산"""
+    pts = np.array([(landmarks[i].x, landmarks[i].y) for i in eye_indices])
+    # 수직 거리 2개
+    v1 = np.linalg.norm(pts[1] - pts[5])
+    v2 = np.linalg.norm(pts[2] - pts[4])
+    # 수평 거리 1개
+    h = np.linalg.norm(pts[0] - pts[3])
+    if h < 1e-6:
+        return 0.0
+    return (v1 + v2) / (2.0 * h)
 
 
 def compute_mar(landmarks):
-    """Mouth Aspect Ratio: 입 벌림 정도 (하품 감지)"""
-    pts = np.array([[landmarks[i].x, landmarks[i].y] for i in MOUTH_MAR])
-    vertical   = np.linalg.norm(pts[2] - pts[3])
-    horizontal = np.linalg.norm(pts[0] - pts[1])
-    return vertical / (horizontal + 1e-6)
+    """Mouth Aspect Ratio 계산"""
+    pts = np.array([(landmarks[i].x, landmarks[i].y) for i in MOUTH])
+    # 수직 거리 3개 (입의 상하 열림)
+    v1 = np.linalg.norm(pts[2] - pts[6])  # 39-269
+    v2 = np.linalg.norm(pts[3] - pts[7])  # 181-405
+    v3 = np.linalg.norm(pts[4] - pts[5])  # 0-17
+    # 수평 거리 1개
+    h = np.linalg.norm(pts[0] - pts[1])   # 61-291
+    if h < 1e-6:
+        return 0.0
+    return (v1 + v2 + v3) / (3.0 * h)
 
 
 def compute_head_pose(landmarks, img_w, img_h):
-    """
-    Head Pose 추정 (solvePnP 사용)
-    반환: pitch(고개 끄덕임), yaw(좌우 회전), roll(기울임)  단위: 도(degree)
-    """
-    face_3d = np.array([
-        [0.0,    0.0,    0.0  ],
-        [0.0,   -330.0, -65.0],
-        [-225.0, 170.0, -135.0],
-        [225.0,  170.0, -135.0],
-        [-150.0,-150.0, -125.0],
-        [150.0, -150.0, -125.0],
+    """Head pose (pitch, yaw, roll) 추정 via solvePnP"""
+    face_2d = np.array([
+        (landmarks[i].x * img_w, landmarks[i].y * img_h)
+        for i in FACE_2D_IDX
     ], dtype=np.float64)
 
-    key_pts = [NOSE_TIP, CHIN, LEFT_EYE_C, RIGHT_EYE_C, LEFT_MOUTH, RIGHT_MOUTH]
-    face_2d = np.array(
-        [[landmarks[i].x * img_w, landmarks[i].y * img_h] for i in key_pts],
-        dtype=np.float64
-    )
-
-    focal = img_w
+    focal_length = img_w
     cam_matrix = np.array([
-        [focal, 0,     img_w / 2],
-        [0,     focal, img_h / 2],
-        [0,     0,     1        ]
+        [focal_length, 0, img_w / 2],
+        [0, focal_length, img_h / 2],
+        [0, 0, 1]
     ], dtype=np.float64)
-    dist = np.zeros((4, 1))
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
 
-    success, rot_vec, _ = cv2.solvePnP(face_3d, face_2d, cam_matrix, dist)
+    success, rvec, tvec = cv2.solvePnP(
+        MODEL_POINTS, face_2d, cam_matrix, dist_coeffs,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
     if not success:
         return 0.0, 0.0, 0.0
 
-    rot_mat, _ = cv2.Rodrigues(rot_vec)
-    angles, *_ = cv2.RQDecomp3x3(rot_mat)
-    pitch = angles[0] * 360
-    yaw   = angles[1] * 360
-    roll  = angles[2] * 360
-
-    # solvePnP 수치 폭발 방지: 물리적으로 불가능한 값 클리핑
-    pitch = float(np.clip(pitch, -90.0, 90.0))
-    yaw   = float(np.clip(yaw,   -90.0, 90.0))
-    roll  = float(np.clip(roll,  -90.0, 90.0))
+    rmat, _ = cv2.Rodrigues(rvec)
+    angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
+    pitch = angles[0]  # 상하
+    yaw = angles[1]    # 좌우
+    roll = angles[2]   # 기울임
     return pitch, yaw, roll
 
 
-# ──────────────────────────────────────────────
-# 시간적 통계 특징 계산
-# ──────────────────────────────────────────────
-
-def compute_temporal_features(raw_features: np.ndarray, mar_arr: np.ndarray,
-                               window: int = TEMPORAL_WINDOW) -> np.ndarray:
+def compute_gaze_offset(landmarks, img_w, img_h):
     """
-    프레임별 원시 특징 + MAR 배열로 시간적 통계 특징을 계산합니다.
-
-    입력:
-        raw_features (T, 7) — [ear_avg, ear_l, ear_r, pitch, yaw, roll, face_detected]
-        mar_arr      (T,)   — MAR 값 (raw에서 제거됐지만 mar_std 계산에 사용)
-    출력:
-        temporal (T, 6)    — [ear_std, mar_std, pitch_std, yaw_std, blink_rate, head_move_mag]
-
-    각 프레임 t에서 [max(0, t-window+1) : t+1] 윈도우의 통계를 계산합니다.
+    Iris 중심과 눈 중심 사이의 오프셋으로 시선 방향 근사.
+    반환: (horizontal_offset, vertical_offset)
+    - 양수 = 오른쪽/아래, 음수 = 왼쪽/위
+    - 눈 너비로 정규화 (-1 ~ 1 범위)
     """
-    T = raw_features.shape[0]
-    temporal = np.zeros((T, 6), dtype=np.float32)
+    try:
+        # 왼쪽 iris 중심
+        l_iris = np.mean([(landmarks[i].x, landmarks[i].y) for i in LEFT_IRIS], axis=0)
+        # 오른쪽 iris 중심
+        r_iris = np.mean([(landmarks[i].x, landmarks[i].y) for i in RIGHT_IRIS], axis=0)
 
-    ear_avg = raw_features[:, 0]
-    mar     = mar_arr          # 별도 전달된 MAR 배열
-    pitch   = raw_features[:, 3]
-    yaw     = raw_features[:, 4]
+        # 왼쪽 눈 양 끝
+        l_eye_inner = np.array([landmarks[362].x, landmarks[362].y])
+        l_eye_outer = np.array([landmarks[263].x, landmarks[263].y])
+        l_eye_center = (l_eye_inner + l_eye_outer) / 2
+        l_eye_width = np.linalg.norm(l_eye_inner - l_eye_outer)
 
-    for t in range(T):
-        start = max(0, t - window + 1)
-        w_ear   = ear_avg[start:t+1]
-        w_mar   = mar[start:t+1]
-        w_pitch = pitch[start:t+1]
-        w_yaw   = yaw[start:t+1]
+        # 오른쪽 눈 양 끝
+        r_eye_inner = np.array([landmarks[33].x, landmarks[33].y])
+        r_eye_outer = np.array([landmarks[133].x, landmarks[133].y])
+        r_eye_center = (r_eye_inner + r_eye_outer) / 2
+        r_eye_width = np.linalg.norm(r_eye_inner - r_eye_outer)
 
-        # 표준편차 — 변동이 클수록 비집중 가능성
-        temporal[t, 0] = np.std(w_ear)
-        temporal[t, 1] = np.std(w_mar)
-        temporal[t, 2] = np.std(w_pitch)
-        temporal[t, 3] = np.std(w_yaw)
+        if l_eye_width < 1e-6 or r_eye_width < 1e-6:
+            return 0.0, 0.0
 
-        # 눈 깜빡임 빈도 (윈도우 내 blink 횟수 / 윈도우 길이)
-        blinks = np.sum(w_ear < EAR_BLINK_THRESHOLD)
-        temporal[t, 4] = blinks / len(w_ear)
+        # 각 눈별 오프셋 계산 후 평균
+        l_offset = (l_iris - l_eye_center) / l_eye_width
+        r_offset = (r_iris - r_eye_center) / r_eye_width
 
-        # 머리 움직임 크기 (pitch + yaw 변화의 누적)
-        if len(w_pitch) > 1:
-            d_pitch = np.abs(np.diff(w_pitch))
-            d_yaw   = np.abs(np.diff(w_yaw))
-            temporal[t, 5] = (np.mean(d_pitch) + np.mean(d_yaw))
-        else:
-            temporal[t, 5] = 0.0
+        avg_h = (l_offset[0] + r_offset[0]) / 2  # 좌우
+        avg_v = (l_offset[1] + r_offset[1]) / 2  # 상하
 
-    return temporal
+        return float(avg_h), float(avg_v)
+    except (IndexError, ValueError):
+        return 0.0, 0.0
 
 
-# ──────────────────────────────────────────────
-# 최종 특징 이름 (원시 8 + 시간적 6 = 14)
-# ──────────────────────────────────────────────
-RAW_FEATURE_NAMES = [
-    "ear_avg", "ear_left", "ear_right",
-    "pitch", "yaw", "roll", "face_detected",
-    # MAR 제거: r=-0.022로 레이블과 상관관계 없음 (mar_std는 temporal에서 유지)
-]
-TEMPORAL_FEATURE_NAMES = [
-    "ear_std", "mar_std", "pitch_std", "yaw_std",
-    "blink_rate", "head_move_mag",
-]
-FEATURE_NAMES = RAW_FEATURE_NAMES + TEMPORAL_FEATURE_NAMES
-N_RAW_FEATURES = len(RAW_FEATURE_NAMES)   # 7
-N_FEATURES = len(FEATURE_NAMES)            # 13
-MAX_FRAMES = 300
+# ── 라벨 로드 ───────────────────────────────────────────────────
 
-
-# ──────────────────────────────────────────────
-# 영상 1개에서 프레임별 특징 추출
-# ──────────────────────────────────────────────
-
-def extract_features_from_video(video_path: str, face_mesh) -> np.ndarray:
+def load_labels(label_csv):
     """
-    단일 영상에서 원시 특징 + 시간적 특징을 추출합니다.
-
-    Returns:
-        features: (T, N_FEATURES) float32 배열
+    DAiSEE 라벨 CSV → {clip_id: label} 딕셔너리
+    Drowsiness-oriented labeling:
+      Alert (1): Engagement >= 2 AND Boredom <= 1
+      Drowsy (0): Engagement <= 1 OR Boredom >= 2
     """
-    cap = cv2.VideoCapture(video_path)
+    labels = {}
+    with open(label_csv, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            clip_id = row['ClipID'].replace('.avi', '')
+            engagement = int(row['Engagement'])
+            boredom = int(row['Boredom'])
+
+            if engagement <= 1 or boredom >= 2:
+                labels[clip_id] = 0  # Drowsy/Unfocused
+            else:
+                labels[clip_id] = 1  # Alert/Focused
+    return labels
+
+
+# ── 영상에서 feature 추출 ───────────────────────────────────────
+
+def extract_video_features(video_path, max_frames=300):
+    """
+    한 영상에서 프레임별 feature 벡터 추출.
+    반환: np.ndarray (num_frames, 10)
+      [ear_left, ear_right, ear_avg, mar, pitch, yaw, roll,
+       gaze_h, gaze_v, face_detected]
+    """
+    cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        log.warning(f"영상을 열 수 없습니다: {video_path}")
-        return np.zeros((1, N_FEATURES), dtype=np.float32)
+        return None
 
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    raw_features = []
-    mar_values   = []   # mar_std 계산용으로만 별도 보관
+    features = []
+    frame_count = 0
 
-    while cap.isOpened() and len(raw_features) < MAX_FRAMES:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = face_mesh.process(rgb)
-
-        if result.multi_face_landmarks:
-            lm = result.multi_face_landmarks[0].landmark
-            ear_l = compute_ear(lm, LEFT_EYE_EAR)
-            ear_r = compute_ear(lm, RIGHT_EYE_EAR)
-            ear_avg = (ear_l + ear_r) / 2.0
-            mar = compute_mar(lm)
-            pitch, yaw, roll = compute_head_pose(lm, w, h)
-            # [ear_avg, ear_l, ear_r, pitch, yaw, roll, face_detected] — MAR raw 제외
-            raw_features.append([ear_avg, ear_l, ear_r, pitch, yaw, roll, 1.0])
-            mar_values.append(mar)
-        else:
-            raw_features.append([0.0] * N_RAW_FEATURES)
-            mar_values.append(0.0)
-
-    cap.release()
-
-    if len(raw_features) == 0:
-        return np.zeros((1, N_FEATURES), dtype=np.float32)
-
-    raw_arr = np.array(raw_features, dtype=np.float32)   # (T, 7)
-    mar_arr = np.array(mar_values,   dtype=np.float32)   # (T,)
-    temporal_arr = compute_temporal_features(raw_arr, mar_arr)  # (T, 6)
-
-    return np.concatenate([raw_arr, temporal_arr], axis=1)  # (T, 13)
-
-
-# ──────────────────────────────────────────────
-# 다중 조건 레이블 이진화
-# ──────────────────────────────────────────────
-
-def compute_label(row) -> int:
-    """
-    DAiSEE 4가지 감정 레이블을 종합하여 이진 집중도 레이블을 산출합니다.
-
-    집중(1):  Engagement >= 2 AND 부정적 감정(Boredom, Confusion, Frustration) 모두 <= 1
-    비집중(0): Engagement <= 1 OR 부정적 감정 중 하나라도 >= 2
-
-    이 전략은 단순히 Engagement만 보는 것보다 '비집중' 클래스를 확대하여
-    극심한 클래스 불균형(95% vs 5%)을 완화합니다.
-    """
-    eng = int(row["Engagement"])
-    bor = int(row["Boredom"])
-    con = int(row["Confusion"])
-    fru = int(row["Frustration"])
-
-    if eng <= 1:
-        return 0
-    if bor >= 2 or con >= 2 or fru >= 2:
-        return 0
-    return 1
-
-
-# ──────────────────────────────────────────────
-# DAiSEE split 전체 처리
-# ──────────────────────────────────────────────
-
-def build_file_index(split_dir: str) -> dict:
-    """split 폴더 내 모든 .avi 파일을 {파일명: 전체경로}로 인덱싱"""
-    index = {}
-    log.info(f"파일 인덱스 구축 중: {split_dir}")
-    for root, _, files in os.walk(split_dir):
-        for f in files:
-            if f.endswith(".avi"):
-                index[f] = os.path.join(root, f)
-    log.info(f"  → {len(index)}개 .avi 파일 발견")
-    return index
-
-
-def process_split(split: str, labels_df: pd.DataFrame):
-    """
-    한 split(Train/Validation/Test)을 처리합니다.
-
-    Returns:
-        X: list of (T, N_FEATURES) arrays
-        y: list of int (0 or 1)
-        clip_ids: list of str
-    """
-    split_dir = os.path.join(DATASET_DIR, split)
-    if not os.path.isdir(split_dir):
-        log.error(f"폴더가 없습니다: {split_dir}")
-        return [], [], []
-
-    file_index = build_file_index(split_dir)
-
-    X, y, clip_ids = [], [], []
-    id_col = "ClipID" if "ClipID" in labels_df.columns else labels_df.columns[0]
-
-    failed = 0
-    with mp.solutions.face_mesh.FaceMesh(
+    with mp_face_mesh.FaceMesh(
         static_image_mode=False,
         max_num_faces=1,
-        refine_landmarks=True,
+        refine_landmarks=True,  # iris 랜드마크 활성화
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     ) as face_mesh:
-        for _, row in tqdm(labels_df.iterrows(), total=len(labels_df), desc=f"[{split}]"):
-            clip_name = str(row[id_col])
-            label = compute_label(row)
 
-            video_path = file_index.get(clip_name)
-            if video_path is None:
-                video_path = file_index.get(os.path.basename(clip_name))
-            if video_path is None:
-                failed += 1
+        while cap.isOpened() and frame_count < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_count += 1
+            img_h, img_w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb)
+
+            if results.multi_face_landmarks:
+                lm = results.multi_face_landmarks[0].landmark
+
+                ear_l = compute_ear(lm, LEFT_EYE)
+                ear_r = compute_ear(lm, RIGHT_EYE)
+                ear_avg = (ear_l + ear_r) / 2
+                mar = compute_mar(lm)
+                pitch, yaw, roll = compute_head_pose(lm, img_w, img_h)
+                gaze_h, gaze_v = compute_gaze_offset(lm, img_w, img_h)
+
+                features.append([
+                    ear_l, ear_r, ear_avg, mar,
+                    pitch, yaw, roll,
+                    gaze_h, gaze_v,
+                    1.0  # face_detected
+                ])
+            else:
+                # 얼굴 미감지 → 0 벡터
+                features.append([0.0] * 9 + [0.0])
+
+    cap.release()
+
+    if len(features) == 0:
+        return None
+
+    return np.array(features, dtype=np.float32)
+
+
+# ── 메인 실행 ───────────────────────────────────────────────────
+
+def process_split(split_name, data_root, label_csv, output_path):
+    """한 split (Train/Validation/Test) 전체 처리"""
+    labels = load_labels(label_csv)
+    split_dir = data_root / "DataSet" / split_name
+
+    if not split_dir.exists():
+        print(f"[WARN] {split_dir} does not exist, skipping.")
+        return
+
+    all_features = []
+    all_labels = []
+    all_clip_ids = []
+    skipped = 0
+
+    # 모든 클립 디렉토리 수집
+    clip_dirs = []
+    for user_dir in sorted(split_dir.iterdir()):
+        if not user_dir.is_dir():
+            continue
+        for clip_dir in sorted(user_dir.iterdir()):
+            if not clip_dir.is_dir():
+                continue
+            clip_dirs.append(clip_dir)
+
+    print(f"\n[{split_name}] Processing {len(clip_dirs)} clips...")
+
+    for clip_dir in tqdm(clip_dirs, desc=split_name):
+        clip_id = clip_dir.name
+
+        # 라벨 확인
+        if clip_id not in labels:
+            skipped += 1
+            continue
+
+        # 영상 파일 찾기
+        video_file = clip_dir / f"{clip_id}.avi"
+        if not video_file.exists():
+            # 다른 확장자 시도
+            for ext in ['.mp4', '.avi', '.mov']:
+                alt = clip_dir / f"{clip_id}{ext}"
+                if alt.exists():
+                    video_file = alt
+                    break
+            else:
+                skipped += 1
                 continue
 
-            feat = extract_features_from_video(video_path, face_mesh)
-            X.append(feat)
-            y.append(label)
-            clip_ids.append(clip_name)
+        # feature 추출
+        feats = extract_video_features(video_file)
+        if feats is None or len(feats) < 10:
+            skipped += 1
+            continue
 
-    log.info(f"[{split}] 완료: {len(X)}개 추출, {failed}개 파일 없음")
+        all_features.append(feats)
+        all_labels.append(labels[clip_id])
+        all_clip_ids.append(clip_id)
 
-    # 클래스 분포 출력
-    y_arr = np.array(y)
-    n0 = (y_arr == 0).sum()
-    n1 = (y_arr == 1).sum()
-    log.info(f"[{split}] 클래스 분포 → 비집중(0): {n0} ({n0/max(len(y),1)*100:.1f}%)  "
-             f"집중(1): {n1} ({n1/max(len(y),1)*100:.1f}%)")
+    print(f"[{split_name}] Extracted: {len(all_features)}, Skipped: {skipped}")
 
-    return X, y, clip_ids
+    # 클래스 분포
+    labels_arr = np.array(all_labels)
+    n_alert = np.sum(labels_arr == 1)
+    n_drowsy = np.sum(labels_arr == 0)
+    print(f"[{split_name}] Alert: {n_alert}, Drowsy: {n_drowsy} "
+          f"(ratio {n_drowsy/(n_alert+n_drowsy)*100:.1f}%)")
+
+    # 저장
+    np.savez_compressed(
+        output_path,
+        features=np.array(all_features, dtype=object),
+        labels=labels_arr,
+        clip_ids=np.array(all_clip_ids),
+    )
+    print(f"[{split_name}] Saved to {output_path}")
 
 
 def main():
-    log.info("=== Step 1: DAiSEE 특징 추출 시작 ===")
-    log.info(f"DAiSEE 경로: {DAISEE_ROOT}")
-    log.info(f"출력 경로  : {OUTPUT_DIR}")
-    log.info(f"특징 수    : {N_FEATURES}개 (원시 {N_RAW_FEATURES} + 시간적 {len(TEMPORAL_FEATURE_NAMES)})")
+    base = Path(__file__).resolve().parent.parent
+    data_root = base / "data" / "DAiSEE" / "DAiSEE"
+    labels_dir = data_root / "Labels"
+    output_dir = base / "data" / "features"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not os.path.isdir(DAISEE_ROOT):
-        log.error(
-            f"\n❌ DAiSEE 경로를 찾을 수 없습니다: {DAISEE_ROOT}\n"
-            "   step1_extract_features.py 상단의 DAISEE_ROOT 경로를 확인하세요."
-        )
-        return
-
-    split_map = {
-        "Train":      "TrainLabels.csv",
-        "Validation": "ValidationLabels.csv",
-        "Test":       "TestLabels.csv",
+    splits = {
+        "Train": labels_dir / "TrainLabels.csv",
+        "Validation": labels_dir / "ValidationLabels.csv",
+        "Test": labels_dir / "TestLabels.csv",
     }
 
-    for split, label_file in split_map.items():
-        label_path = os.path.join(LABELS_DIR, label_file)
-        if not os.path.isfile(label_path):
-            log.warning(f"레이블 파일 없음, 건너뜀: {label_path}")
-            continue
+    for split_name, label_csv in splits.items():
+        output_path = output_dir / f"{split_name.lower()}_features.npz"
+        process_split(split_name, data_root, label_csv, output_path)
 
-        labels_df = pd.read_csv(label_path)
-        labels_df.columns = labels_df.columns.str.strip()
-        log.info(f"[{split}] 레이블 로드: {len(labels_df)}개 클립")
-
-        X, y, clip_ids = process_split(split, labels_df)
-        if len(X) == 0:
-            log.warning(f"[{split}] 추출된 데이터 없음, 건너뜀")
-            continue
-
-        # 저장 (가변 길이 시퀀스 → object array)
-        out_path = os.path.join(OUTPUT_DIR, f"{split.lower()}_features.npz")
-        X_arr = np.empty(len(X), dtype=object)
-        for i, seq in enumerate(X):
-            X_arr[i] = seq
-
-        np.savez(
-            out_path,
-            X=X_arr,
-            y=np.array(y, dtype=np.int32),
-            clip_ids=np.array(clip_ids),
-            feature_names=np.array(FEATURE_NAMES),
-        )
-        log.info(f"[{split}] 저장 완료 → {out_path}")
-
-    log.info("=== Step 1 완료! ===")
-    log.info("다음 단계: python src/step2_prepare_dataset.py")
+    print("\n✓ Feature extraction complete!")
 
 
 if __name__ == "__main__":
