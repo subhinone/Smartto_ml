@@ -133,7 +133,7 @@ async def analyze(req: AnalyzeRequest):
 
     # 3. Rule-based 판단
     rule_result = rule_detector.update(ear, mar, face_detected, now)
-    distraction_signals = distraction_detector.update(face_detected, yaw, ear, now)
+    distraction_signals, continuous_scores = distraction_detector.update(face_detected, yaw, ear, now)
 
     rule_reasons = []
     if rule_result.get("drowsy"):
@@ -144,20 +144,23 @@ async def analyze(req: AnalyzeRequest):
 
     # 4. ML 판단 (모델이 있고 버퍼가 충분할 때)
     ml_focused = True
+    ml_confidence = 0.5
     if model is not None and len(feature_buffer) >= 30:
         window_features = np.array([[f[0], f[1], f[2]] for f in list(feature_buffer)[-90:]])
         clip_feat = compute_clip_features(window_features).reshape(1, -1)
         try:
             pred = model.predict(clip_feat)[0]
             ml_focused = bool(pred == 1)
+            ml_confidence = float(model.predict_proba(clip_feat)[0].max())
             ml_history.append(ml_focused)
             if len(ml_history) == 3 and len(set(ml_history)) == 1:
                 stable_ml_focused = ml_history[0]
         except Exception:
             pass
 
-    # 5. 집중도 점수 계산
-    focus_score = compute_focus_score(stable_ml_focused, distraction_signals, rule_reasons)
+    # 5. 집중도 점수 계산 (연속값 기반)
+    is_drowsy = bool(rule_result.get("drowsy"))
+    focus_score = compute_focus_score(ml_confidence, is_drowsy, continuous_scores)
 
     # 6. 최종 상태 결정
     if rule_result.get("drowsy"):
@@ -170,7 +173,7 @@ async def analyze(req: AnalyzeRequest):
         status = "Distracted"
 
     return AnalyzeResponse(
-        focus_score=round(focus_score, 1),
+        focus_score=focus_score,
         status=status,
         ear=round(ear, 3),
         mar=round(mar, 3),

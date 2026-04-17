@@ -23,7 +23,6 @@ ENV/
 
 # Data (대용량 파일 제외)
 data/DAiSEE/
-data/CMOSE/
 data/features/*.npy
 data/features/*.npz
 

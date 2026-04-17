@@ -67,9 +67,11 @@ class Config:
 
     # 집중도 점수 가중치 (합계 = 1.0)
     W_ML = 0.50                   # ML 판단 (졸음 여부)
-    W_PRESENCE = 0.20             # 자리 이탈 없음
-    W_HEAD = 0.20                 # 고개 정면 유지
-    W_STARE = 0.10                # 멍때리기 없음
+    W_PRESENCE = 0.30             # 자리 이탈 없음
+    W_STARE = 0.20                # 멍때리기 없음
+
+    # 멍때리기 정상 깜빡임 기준 (30초당 평균 ~6회)
+    NORMAL_BLINK_PER_WINDOW = 6
 
 
 # ── Rule-based 판단기 ───────────────────────────────────────────
@@ -136,12 +138,14 @@ class DistractionDetector:
     def update(self, face_detected, yaw, ear_avg, timestamp):
         """
         매 프레임 업데이트.
-        반환: dict {signal: bool} — 각 비집중 신호 활성화 여부
+        반환: (signals, scores)
+          signals: dict {signal: bool} — 각 비집중 신호 활성화 여부 (상태 표시용)
+          scores:  dict {signal: float 0.0~1.0} — 연속값 점수 (집중도 계산용)
         """
         signals = {
-            'head_turned': False,   # 고개 장시간 돌림
-            'absent':      False,   # 자리 이탈
-            'staring':     False,   # 멍때리기
+            'head_turned': False,
+            'absent':      False,
+            'staring':     False,
         }
 
         # ── 자리 이탈 ──
@@ -152,40 +156,55 @@ class DistractionDetector:
         else:
             self.no_face_frames = 0
 
-        if not face_detected:
-            return signals
+        # presence_score: 얼굴 미감지 프레임 비율 → 1.0(완전 존재) ~ 0.0(이탈)
+        absent_threshold_frames = self.fps * Config.NO_FACE_ABSENT
+        presence_ratio = 1.0 - min(self.no_face_frames / absent_threshold_frames, 1.0)
 
-        # ── 고개 장시간 돌림 ──
+        if not face_detected:
+            scores = {
+                'presence_ratio': presence_ratio,
+                'blink_ratio':    0.0,
+            }
+            return signals, scores
+
+        # ── 고개 장시간 돌림 (상태 표시용으로 유지) ──
         if abs(yaw) > Config.HEAD_TURN_YAW:
             self.head_turn_frames += 1
             if self.head_turn_frames >= self.fps * Config.HEAD_TURN_DURATION:
                 signals['head_turned'] = True
         else:
-            self.head_turn_frames = max(0, self.head_turn_frames - 2)  # 서서히 감소
+            self.head_turn_frames = max(0, self.head_turn_frames - 2)
 
         # ── 멍때리기: 윈도우 내 눈깜빡임 부족 ──
         ear_closed = ear_avg < Config.EAR_CLOSE_THRESHOLD
-        is_blink = (not self.prev_ear_closed) and ear_closed  # 눈 감기는 순간
+        is_blink = (not self.prev_ear_closed) and ear_closed
         self.prev_ear_closed = ear_closed
 
-        # 윈도우 내 깜빡임 기록
         self.blink_window.append((timestamp, is_blink))
         if is_blink:
             self.blink_count_window += 1
 
-        # 오래된 기록 제거
         cutoff = timestamp - Config.STARE_BLINK_WINDOW
         while self.blink_window and self.blink_window[0][0] < cutoff:
             _, old_blink = self.blink_window.popleft()
             if old_blink:
                 self.blink_count_window -= 1
 
-        # 윈도우가 충분히 찼을 때만 멍때리기 판단
         window_full = (len(self.blink_window) >= self.fps * Config.STARE_BLINK_WINDOW * 0.8)
         if window_full and self.blink_count_window <= Config.STARE_BLINK_MIN:
             signals['staring'] = True
 
-        return signals
+        # blink_ratio: 깜빡임 횟수 / 정상 기준 → 1.0(정상) ~ 0.0(멍때리기)
+        if window_full:
+            blink_ratio = min(self.blink_count_window / Config.NORMAL_BLINK_PER_WINDOW, 1.0)
+        else:
+            blink_ratio = 1.0  # 윈도우 미충족 시 정상으로 간주
+
+        scores = {
+            'presence_ratio': presence_ratio,
+            'blink_ratio':    blink_ratio,
+        }
+        return signals, scores
 
 
 # ── ML 판단기 ───────────────────────────────────────────────────
@@ -233,37 +252,32 @@ class MLDetector:
 # ── 적응형 타이머 ───────────────────────────────────────────────
 
 class AdaptiveTimer:
-    """세션 집중도에 따라 다음 세션 시간 추천"""
-
     def __init__(self):
         self.current_focus_min = Config.DEFAULT_FOCUS_MIN
         self.current_break_min = Config.DEFAULT_BREAK_MIN
-        self.session_scores = []  # 각 세션의 평균 집중도
+        self.session_scores = [] 
 
     def record_session(self, avg_focus_score):
-        """세션 종료 시 집중도 점수 기록 (0~1)"""
         self.session_scores.append(avg_focus_score)
 
     def recommend_next(self):
-        """다음 세션 시간 추천"""
         if not self.session_scores:
             return self.current_focus_min, self.current_break_min
 
         last_score = self.session_scores[-1]
 
-        if last_score >= 0.7:
-            # 집중 잘 함 → 세션 시간 늘리기
+        if last_score >= 70:
             self.current_focus_min = min(
                 self.current_focus_min + Config.FOCUS_ADJUST_STEP,
                 Config.MAX_FOCUS_MIN
             )
             self.current_break_min = 5
             msg = f"Great focus! Next: {self.current_focus_min}min study + {self.current_break_min}min break"
-        elif last_score >= 0.4:
-            # 보통 → 유지
+
+        elif last_score >= 40:
             msg = f"Not bad! Keeping {self.current_focus_min}min study + {self.current_break_min}min break"
+
         else:
-            # 집중 못함 → 세션 줄이기, 휴식 늘리기
             self.current_focus_min = max(
                 self.current_focus_min - Config.FOCUS_ADJUST_STEP,
                 Config.MIN_FOCUS_MIN
@@ -276,24 +290,21 @@ class AdaptiveTimer:
 
 # ── 메인 실시간 루프 ────────────────────────────────────────────
 
-def compute_focus_score(ml_focused, distraction_signals, rule_reasons):
+def compute_focus_score(ml_confidence, is_drowsy, continuous_scores):
     """
-    가중치 기반 집중도 점수 계산 (0.0 ~ 1.0)
-
-    ML(졸음 여부) × 0.5
-    + 자리 이탈 없음  × 0.2
-    + 고개 정면 유지  × 0.2
-    + 멍때리기 없음   × 0.1
+    연속값 기반 집중도 점수 계산.
+    반환: int (0 ~ 100)
     """
-    # 졸음/눈감김/하품 감지 시 ML 점수 0
-    is_drowsy = bool(rule_reasons)
-    ml_score = Config.W_ML * (1.0 if (ml_focused and not is_drowsy) else 0.0)
+    # ML: 졸음이면 confidence를 반전 (졸음 확신 높을수록 낮은 점수)
+    ml_score = Config.W_ML * (ml_confidence if not is_drowsy else (1.0 - ml_confidence))
 
-    presence_score = Config.W_PRESENCE * (0.0 if distraction_signals.get('absent') else 1.0)
-    head_score     = Config.W_HEAD     * (0.0 if distraction_signals.get('head_turned') else 1.0)
-    stare_score    = Config.W_STARE    * (0.0 if distraction_signals.get('staring') else 1.0)
+    # 자리 이탈: 얼굴 감지 비율 (1.0 = 계속 있음, 0.0 = 완전 이탈)
+    presence_score = Config.W_PRESENCE * continuous_scores.get('presence_ratio', 1.0)
 
-    return ml_score + presence_score + head_score + stare_score
+    # 멍때리기: 깜빡임 빈도 비율 (1.0 = 정상, 0.0 = 전혀 안 깜빡임)
+    stare_score = Config.W_STARE * continuous_scores.get('blink_ratio', 1.0)
+
+    return int((ml_score + presence_score + stare_score) * 100)
 
 
 def run_realtime(use_model=True):
@@ -327,6 +338,7 @@ def run_realtime(use_model=True):
     ml_focused = True
     ml_confidence = 0.5
     distraction_signals = {'head_turned': False, 'absent': False, 'staring': False}
+    continuous_scores = {'presence_ratio': 1.0, 'blink_ratio': 1.0}
 
     # 상태 안정화: 3번 연속 같은 결과여야 화면에 반영
     ml_history = deque(maxlen=3)
@@ -385,7 +397,7 @@ def run_realtime(use_model=True):
             rule_reasons = rule_detector.update(ear_avg, mar, face_detected)
 
             # ── 2층: 비집중 감지 (지속 시간 기반) ──
-            distraction_signals = distraction_detector.update(
+            distraction_signals, continuous_scores = distraction_detector.update(
                 face_detected, yaw, ear_avg, now
             )
 
@@ -398,8 +410,9 @@ def run_realtime(use_model=True):
                     stable_ml_focused = ml_history[0]
                 last_ml_time = now
 
-            # ── 집중도 점수 계산 ──
-            score = compute_focus_score(stable_ml_focused, distraction_signals, rule_reasons)
+            # ── 집중도 점수 계산 (연속값 기반) ──
+            is_drowsy = bool(rule_reasons)
+            score = compute_focus_score(ml_confidence, is_drowsy, continuous_scores)
             focus_scores.append(score)
 
             # ── 상태 텍스트 & 색상 결정 ──
