@@ -32,7 +32,7 @@ from step1_extract_features import (
 )
 from step2_prepare_dataset import compute_clip_features
 from step4_realtime import (
-    Config, RuleBasedDetector, DistractionDetector, compute_focus_score,
+    Config, RuleBasedDetector, DistractionDetector, AdaptiveTimer, compute_focus_score,
 )
 import mediapipe as mp
 
@@ -72,9 +72,11 @@ face_mesh = mp.solutions.face_mesh.FaceMesh(
 # 실시간 상태 (세션 단위로 유지)
 rule_detector       = RuleBasedDetector()
 distraction_detector = DistractionDetector()
+adaptive_timer      = AdaptiveTimer()
 feature_buffer: deque = deque(maxlen=150)   # 최근 5초 × 30fps
 ml_history: deque   = deque(maxlen=3)
 stable_ml_focused   = True
+session_scores: list = []  # 현재 세션 점수 기록
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Request / Response 모델
@@ -161,6 +163,7 @@ async def analyze(req: AnalyzeRequest):
     # 5. 집중도 점수 계산 (연속값 기반)
     is_drowsy = bool(rule_result.get("drowsy"))
     focus_score = compute_focus_score(ml_confidence, is_drowsy, continuous_scores)
+    session_scores.append(focus_score)
 
     # 6. 최종 상태 결정
     if rule_result.get("drowsy"):
@@ -189,11 +192,71 @@ async def health():
 
 @app.post("/reset")
 async def reset():
-    """세션 시작 시 상태 초기화"""
-    global rule_detector, distraction_detector, feature_buffer, ml_history, stable_ml_focused
+    """세션 시작 시 상태 초기화 (타이머 설정은 유지)"""
+    global rule_detector, distraction_detector, feature_buffer, ml_history, stable_ml_focused, session_scores
     rule_detector        = RuleBasedDetector()
     distraction_detector = DistractionDetector()
     feature_buffer.clear()
     ml_history.clear()
     stable_ml_focused = True
+    session_scores = []
     return {"status": "reset ok"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 세션 종료 & 타이머 추천
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/session/end")
+async def session_end():
+    """
+    세션 종료 시 호출.
+    평균 집중도 점수를 기록하고 다음 세션 추천값을 반환.
+    """
+    global session_scores
+    if not session_scores:
+        return {"error": "세션 데이터가 없습니다"}
+
+    avg_score = int(sum(session_scores) / len(session_scores))
+    adaptive_timer.record_session(avg_score)
+    recommendation = adaptive_timer.recommend_next()
+
+    # 세션 점수 초기화
+    session_scores = []
+
+    return {
+        "avg_score": avg_score,
+        **recommendation,
+    }
+
+
+class ApplyTimerRequest(BaseModel):
+    focus_min: int | None = None    # 사용자가 수정한 집중 시간 (없으면 추천값 적용)
+    break_min: int | None = None    # 사용자가 수정한 휴식 시간 (없으면 추천값 적용)
+
+
+@app.post("/session/apply")
+async def session_apply(req: ApplyTimerRequest):
+    """
+    사용자가 추천을 수락하거나 직접 수정한 값을 적용.
+    """
+    focus, brk = adaptive_timer.apply_recommendation(req.focus_min, req.break_min)
+    return {
+        "applied_focus_min": focus,
+        "applied_break_min": brk,
+        "message": f"{focus}분 공부 / {brk}분 휴식으로 설정했어요!",
+    }
+
+
+class MaxTimeRequest(BaseModel):
+    max_focus_min: int    # 사용자가 설정할 최대 집중 시간
+
+
+@app.post("/settings/max-time")
+async def set_max_time(req: MaxTimeRequest):
+    """사용자가 최대 집중 시간을 직접 설정"""
+    adaptive_timer.set_max_focus(req.max_focus_min)
+    return {
+        "max_focus_min": adaptive_timer.max_focus_min,
+        "message": f"최대 집중 시간을 {adaptive_timer.max_focus_min}분으로 설정했어요!",
+    }

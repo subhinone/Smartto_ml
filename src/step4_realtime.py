@@ -62,8 +62,10 @@ class Config:
     DEFAULT_FOCUS_MIN = 25        # 기본 집중 세션 (분)
     DEFAULT_BREAK_MIN = 5         # 기본 휴식 (분)
     MIN_FOCUS_MIN = 25            # 최소 집중 세션
-    MAX_FOCUS_MIN = 50            # 최대 집중 세션
+    DEFAULT_MAX_FOCUS_MIN = 50    # 기본 최대 집중 세션 (사용자 변경 가능)
     FOCUS_ADJUST_STEP = 5         # 조절 단위 (분)
+    BREAK_RATIO = 5               # 휴식 = 집중 / BREAK_RATIO
+    POOR_BREAK_MIN = 10           # 부진 시 최소 휴식 (분)
 
     # 집중도 점수 가중치 (합계 = 1.0)
     W_ML = 0.50                   # ML 판단 (졸음 여부)
@@ -252,40 +254,75 @@ class MLDetector:
 # ── 적응형 타이머 ───────────────────────────────────────────────
 
 class AdaptiveTimer:
-    def __init__(self):
+    def __init__(self, max_focus_min=None):
         self.current_focus_min = Config.DEFAULT_FOCUS_MIN
         self.current_break_min = Config.DEFAULT_BREAK_MIN
-        self.session_scores = [] 
+        self.max_focus_min = max_focus_min or Config.DEFAULT_MAX_FOCUS_MIN
+        self.session_scores = []
+
+    def set_max_focus(self, minutes):
+        """사용자가 최대 집중 시간을 직접 설정"""
+        self.max_focus_min = max(minutes, Config.MIN_FOCUS_MIN)
 
     def record_session(self, avg_focus_score):
         self.session_scores.append(avg_focus_score)
 
     def recommend_next(self):
+        """
+        추천값만 반환. 실제 적용은 사용자가 수락한 뒤 apply_recommendation()으로.
+        """
         if not self.session_scores:
-            return self.current_focus_min, self.current_break_min
+            return {
+                "recommended_focus_min": self.current_focus_min,
+                "recommended_break_min": self.current_break_min,
+                "message": "첫 세션입니다. 화이팅!",
+                "score": None,
+                "level": "start",
+            }
 
         last_score = self.session_scores[-1]
 
         if last_score >= 70:
-            self.current_focus_min = min(
+            rec_focus = min(
                 self.current_focus_min + Config.FOCUS_ADJUST_STEP,
-                Config.MAX_FOCUS_MIN
+                self.max_focus_min
             )
-            self.current_break_min = 5
-            msg = f"Great focus! Next: {self.current_focus_min}min study + {self.current_break_min}min break"
+            rec_break = rec_focus // Config.BREAK_RATIO
+            msg = f"집중도가 높았어요! {rec_focus}분 공부 / {rec_break}분 휴식 어때요?"
+            level = "good"
 
         elif last_score >= 40:
-            msg = f"Not bad! Keeping {self.current_focus_min}min study + {self.current_break_min}min break"
+            rec_focus = self.current_focus_min
+            rec_break = rec_focus // Config.BREAK_RATIO
+            msg = f"괜찮은 세션이었어요! {rec_focus}분 / {rec_break}분 유지할까요?"
+            level = "normal"
 
         else:
-            self.current_focus_min = max(
+            rec_focus = max(
                 self.current_focus_min - Config.FOCUS_ADJUST_STEP,
                 Config.MIN_FOCUS_MIN
             )
-            self.current_break_min = 10
-            msg = f"Tough session! Next: {self.current_focus_min}min study + {self.current_break_min}min break"
+            rec_break = max(rec_focus // Config.BREAK_RATIO, Config.POOR_BREAK_MIN)
+            msg = f"좀 힘들었죠? {rec_focus}분 공부 / {rec_break}분 휴식 추천해요!"
+            level = "poor"
 
-        return self.current_focus_min, self.current_break_min, msg
+        return {
+            "recommended_focus_min": rec_focus,
+            "recommended_break_min": rec_break,
+            "message": msg,
+            "score": last_score,
+            "level": level,
+        }
+
+    def apply_recommendation(self, focus_min=None, break_min=None):
+        """
+        사용자가 추천을 수락하거나 직접 수정한 값을 적용.
+        인자 없이 호출하면 추천값 그대로 적용.
+        """
+        rec = self.recommend_next()
+        self.current_focus_min = focus_min if focus_min is not None else rec["recommended_focus_min"]
+        self.current_break_min = break_min if break_min is not None else rec["recommended_break_min"]
+        return self.current_focus_min, self.current_break_min
 
 
 # ── 메인 실시간 루프 ────────────────────────────────────────────
